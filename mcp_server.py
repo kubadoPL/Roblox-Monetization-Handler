@@ -1,11 +1,11 @@
 """
-Serwer MCP (stdio) do zarządzania developer productami i gamepassami Roblox.
-Cookie: zmienna ROBLOSECURITY albo cookie.txt obok skryptu.
+MCP server (stdio) for managing Roblox developer products and game passes.
+Cookie: ROBLOSECURITY env variable or cookie.txt next to the script.
 
-Rejestracja w Claude Code:
-    claude mcp add --scope user roblox-monetization -- python "C:/Users/Jakub/Documents/GitHub/Roblox-DevProduct-Copier/mcp_server.py"
+Register in Claude Code:
+    claude mcp add --scope user roblox-monetization -- python "C:/path/to/mcp_server.py"
 
-Roblox API nie ma usuwania dev productów ani gamepassów - "usunięcie" = zdjęcie ze sprzedaży (disable_item).
+The Roblox API can't delete developer products or game passes - disable_item takes them off sale instead.
 """
 
 import contextlib
@@ -18,16 +18,17 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from copy_devproducts import KINDS, Roblox, Abort, copy_kind, load_cookie, price_of, bool_str
+from i18n import t
 
 Kind = Literal["dev", "pass"]
 
 server = MCPServer(
     "roblox-monetization",
     instructions=(
-        "Zarządzanie developer productami (kind='dev') i gamepassami (kind='pass') w grach Roblox. "
-        "universe_id to universeId gry (z URL-a Creator Dashboard), nie placeId. "
-        "Roblox nie pozwala usuwać - disable_item zdejmuje ze sprzedaży. "
-        "Przed copy_items z dry_run=False najpierw pokaż użytkownikowi wynik dry_run=True."
+        "Manages Roblox developer products (kind='dev') and game passes (kind='pass'). "
+        "universe_id is the experience's universe ID (from the Creator Dashboard URL), not the place ID. "
+        "Roblox doesn't allow deleting - disable_item takes an item off sale. "
+        "Before calling copy_items with dry_run=False, show the user the dry_run=True result first."
     ),
 )
 
@@ -42,7 +43,7 @@ def rbx() -> Roblox:
 
 
 def tool(fn):
-    # Błędy Roblox API / brak cookie mają dotrzeć do modelu z treścią, a nie jako ogólny crash
+    # Roblox API errors / missing cookie should reach the model with their message, not as a generic crash
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
@@ -70,7 +71,8 @@ def read_icon(icon_path: str | None) -> bytes | None:
 
 @tool
 def list_items(kind: Kind, universe_id: int) -> list[dict]:
-    """Lista dev productów ('dev') lub gamepassów ('pass') w grze: id, nazwa, cena, for sale, managed pricing."""
+    """Lists developer products ('dev') or game passes ('pass') in an experience: id, name, price, for sale,
+    managed pricing."""
     return [summary(kind, p) for p in rbx().list_items(KINDS[kind], universe_id)]
 
 
@@ -78,7 +80,7 @@ def list_items(kind: Kind, universe_id: int) -> list[dict]:
 def create_item(kind: Kind, universe_id: int, name: str, price: int, description: str = "",
                 is_for_sale: bool = True, managed_pricing: bool = False,
                 icon_path: str | None = None) -> dict:
-    """Tworzy nowy dev product ('dev') lub gamepass ('pass'). icon_path: opcjonalna ścieżka do PNG/JPG."""
+    """Creates a developer product ('dev') or game pass ('pass'). icon_path: optional local PNG/JPG file."""
     fields = {
         "name": name,
         "description": description,
@@ -94,7 +96,7 @@ def update_item(kind: Kind, universe_id: int, item_id: int, name: str | None = N
                 description: str | None = None, price: int | None = None,
                 is_for_sale: bool | None = None, managed_pricing: bool | None = None,
                 icon_path: str | None = None) -> str:
-    """Zmienia wybrane pola dev productu / gamepassa. Pola pominięte zostają bez zmian."""
+    """Changes selected fields of a developer product / game pass. Omitted fields stay unchanged."""
     fields = {}
     if name is not None:
         fields["name"] = name
@@ -107,27 +109,28 @@ def update_item(kind: Kind, universe_id: int, item_id: int, name: str | None = N
     if managed_pricing is not None:
         fields["isManagedPricingEnabled"] = bool_str(managed_pricing)
     if not fields and not icon_path:
-        return "Nic do zmiany."
+        return "Nothing to change."
     rbx().update_item(KINDS[kind], universe_id, item_id, fields, read_icon(icon_path))
-    return f"Zaktualizowano {item_id}: {', '.join(fields) or 'ikona'}"
+    return f"Updated {item_id}: {', '.join(fields) or 'icon'}"
 
 
 @tool
 def disable_item(kind: Kind, universe_id: int, item_id: int) -> str:
-    """'Usuwa' dev product / gamepass - zdejmuje ze sprzedaży (Roblox API nie ma prawdziwego usuwania)."""
+    """'Deletes' a developer product / game pass by taking it off sale (the Roblox API has no real delete)."""
     rbx().update_item(KINDS[kind], universe_id, item_id, {"isForSale": "false"})
-    return f"{item_id} zdjęty ze sprzedaży."
+    return f"{item_id} taken off sale."
 
 
 @tool
 def copy_items(kind: Literal["dev", "pass", "all"], source_universe_id: int, target_universe_id: int,
                dry_run: bool = True, copy_icons: bool = False) -> str:
-    """Kopiuje/synchronizuje dev producty i/lub gamepassy ze źródła do celu (po nazwie): tworzy brakujące,
-    aktualizuje różniące się cenę/opis/for sale/managed pricing. Zwraca log i mapowanie starych ID na nowe."""
+    """Copies / syncs developer products and/or game passes from source to target (matched by name): creates
+    missing ones and updates differing price/description/for sale/managed pricing. Returns the log and the
+    old ID -> new ID mapping."""
     if source_universe_id == target_universe_id:
-        raise Abort("Źródło i cel to ta sama gra.")
+        raise Abort(t("same_game"))
     log = io.StringIO()
-    # stdout to kanał protokołu MCP - log z copy_kind łapiemy do stringa
+    # stdout is the MCP protocol channel - capture copy_kind's log into a string
     with contextlib.redirect_stdout(log):
         for key in (["dev", "pass"] if kind == "all" else [kind]):
             copy_kind(rbx(), key, source_universe_id, target_universe_id, dry_run, copy_icons,

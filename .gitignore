@@ -1,6 +1,6 @@
 cookie.txt
 mapping_*.json
 mapping_*.lua
-lista_*.txt
-lista_*.lua
 __pycache__/
+settings.json
+lists/
