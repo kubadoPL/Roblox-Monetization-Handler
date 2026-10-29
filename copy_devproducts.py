@@ -69,6 +69,10 @@ class Roblox:
             files["imageFile"] = ("icon.png", icon, "image/png")
         return self.request("POST", f"{API}/{universe_id}/developer-products", files=files)
 
+    def update_product(self, universe_id: int, product_id: int, fields: dict) -> None:
+        files = {k: (None, v) for k, v in fields.items()}
+        self.request("PATCH", f"{API}/{universe_id}/developer-products/{product_id}", files=files)
+
     def download_icon(self, asset_id: int) -> bytes | None:
         if not asset_id:
             return None
@@ -107,6 +111,31 @@ def ask_int(prompt: str) -> int:
         print("Podaj samą liczbę.")
 
 
+def sync_managed(rbx: Roblox, src: list[dict], target: int, interactive: bool, forced: bool, delay: float):
+    """Włącza Managed Pricing w celu dla produktów, które mają je włączone w źródle (dopasowanie po nazwie)."""
+    managed_in_src = {p["name"] for p in src if p.get("isManagedPricingEnabled")}
+    todo = [p for p in rbx.list_products(target)
+            if p["name"] in managed_in_src and not p.get("isManagedPricingEnabled")]
+    if not todo:
+        return
+    print(f"\n{len(todo)} produktów w celu nie ma Managed Pricing (a w źródle ma).")
+    if not forced and not (interactive and input("Włączyć im Managed Pricing? [t/N]: ").strip().lower() == "t"):
+        if not interactive:
+            print("Dodaj --sync-managed, żeby to włączyć.")
+        return
+
+    for i, p in enumerate(todo, 1):
+        try:
+            rbx.update_product(target, p["productId"], {"isManagedPricingEnabled": "true"})
+            print(f"[{i}/{len(todo)}] OK  {p['name']}")
+        except Exception as e:
+            print(f"[{i}/{len(todo)}] BŁĄD  {p['name']}: {e}")
+            if "InvalidManagedPricing" in str(e):
+                print("Managed Pricing dalej nie jest zaakceptowane w grze docelowej - przerywam.")
+                return
+        time.sleep(delay)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Kopiowanie developer productów między grami Roblox.")
     ap.add_argument("source", nargs="?", type=int, help="universeId gry źródłowej")
@@ -114,6 +143,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="tylko podgląd, nic nie tworzy")
     ap.add_argument("--icons", action="store_true", help="kopiuj też ikony")
     ap.add_argument("--delay", type=float, default=1.5, help="przerwa między produktami (s)")
+    ap.add_argument("--sync-managed", action="store_true",
+                    help="włącz Managed Pricing w celu tam, gdzie jest włączone w źródle")
     args = ap.parse_args()
 
     interactive = args.source is None or args.target is None
@@ -152,12 +183,13 @@ def main():
 
         mapping = {p["productId"]: existing[p["name"]] for p in src if p["name"] in existing}
         failed = []
+        managed_allowed = True
         for i, p in enumerate(to_create, 1):
             fields = {
                 "name": p["name"],
                 "description": p.get("description") or "",
                 "isForSale": str(bool(p.get("isForSale"))).lower(),
-                "isManagedPricingEnabled": str(bool(p.get("isManagedPricingEnabled"))).lower(),
+                "isManagedPricingEnabled": str(managed_allowed and bool(p.get("isManagedPricingEnabled"))).lower(),
             }
             price = price_of(p)
             if price is not None:
@@ -171,7 +203,17 @@ def main():
                     print(f"   ikona nie poszła: {e}")
 
             try:
-                new = rbx.create_product(target, fields, icon)
+                try:
+                    new = rbx.create_product(target, fields, icon)
+                except RuntimeError as e:
+                    if "InvalidManagedPricing" not in str(e):
+                        raise
+                    # Gra docelowa nie ma zaakceptowanego Managed Pricing - tworzymy bez niego
+                    if managed_allowed:
+                        managed_allowed = False
+                        print("   Managed Pricing nie jest zaakceptowane w grze docelowej - tworzę produkty bez niego.")
+                    fields["isManagedPricingEnabled"] = "false"
+                    new = rbx.create_product(target, fields, icon)
                 mapping[p["productId"]] = new["productId"]
                 print(f"[{i}/{len(to_create)}] OK  {p['name']}  {p['productId']} -> {new['productId']}")
             except Exception as e:
@@ -181,6 +223,12 @@ def main():
 
         if failed:
             print(f"\nNie udało się: {len(failed)} - odpal ponownie, istniejące zostaną pominięte.")
+        if not managed_allowed:
+            print("\nProdukty utworzono BEZ Managed Pricing. Jeśli chcesz, zaakceptuj je w dashboardzie gry docelowej"
+                  " (Monetization -> Managed pricing) i włącz dla produktów.")
+
+    if not args.dry_run:
+        sync_managed(rbx, src, target, interactive, args.sync_managed, args.delay)
 
     # Mapowanie stare ID -> nowe ID do podmiany w kodzie gry
     names = {p["productId"]: p["name"] for p in src}
