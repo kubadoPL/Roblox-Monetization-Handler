@@ -1,0 +1,4 @@
+cookie.txt
+mapping_*.json
+mapping_*.lua
+__pycache__/
