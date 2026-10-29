@@ -1,13 +1,17 @@
 """
-Kopiuje developer producty z jednej gry Roblox do drugiej (nazwa, opis, cena, for sale,
-managed pricing, opcjonalnie ikona). Bez API keya - autoryzacja cookie .ROBLOSECURITY.
+Kopiuje / synchronizuje developer producty i gamepassy między grami Roblox
+(nazwa, opis, cena, for sale, managed pricing, opcjonalnie ikona).
+Istniejące w celu (po nazwie) są aktualizowane, jeśli coś się różni.
+Bez API keya - autoryzacja cookie .ROBLOSECURITY.
 
 Użycie:
-    python copy_devproducts.py                      # tryb interaktywny (pyta o wszystko)
-    python copy_devproducts.py SOURCE TARGET --dry-run
-    python copy_devproducts.py SOURCE TARGET --icons
+    python copy_devproducts.py                                  # menu interaktywne
+    python copy_devproducts.py copy dev  SOURCE TARGET --dry-run
+    python copy_devproducts.py copy pass SOURCE TARGET --icons
+    python copy_devproducts.py copy all  SOURCE TARGET
+    python copy_devproducts.py list all  UNIVERSE
 
-SOURCE / TARGET to universeId (liczba z URL-a dashboardu: .../experiences/<universeId>/...).
+SOURCE / TARGET / UNIVERSE to universeId (liczba z URL-a dashboardu: .../experiences/<universeId>/...).
 Cookie: zmienna środowiskowa ROBLOSECURITY, plik cookie.txt obok skryptu, albo wklejenie przy starcie.
 """
 
@@ -21,9 +25,31 @@ from pathlib import Path
 
 import requests
 
-API = "https://apis.roblox.com/developer-products/v2/universes"
-THUMBS = "https://thumbnails.roblox.com/v1/assets"
 HERE = Path(__file__).resolve().parent
+THUMBS = "https://thumbnails.roblox.com/v1/assets"
+
+KINDS = {
+    "dev": {
+        "label": "Developer producty",
+        "slug": "devproducts",
+        "base": "https://apis.roblox.com/developer-products/v2/universes/{u}/developer-products",
+        "list_key": "developerProducts",
+        "id_key": "productId",
+        "icon_key": "iconImageAssetId",
+    },
+    "pass": {
+        "label": "Gamepassy",
+        "slug": "gamepasses",
+        "base": "https://apis.roblox.com/game-passes/v1/universes/{u}/game-passes",
+        "list_key": "gamePasses",
+        "id_key": "gamePassId",
+        "icon_key": "iconAssetId",
+    },
+}
+
+
+class Abort(Exception):
+    pass
 
 
 class Roblox:
@@ -45,33 +71,35 @@ class Roblox:
                 time.sleep(wait)
                 continue
             if r.status_code == 401:
-                sys.exit("Błąd 401: cookie nieważne albo wygasło.")
+                raise Abort("Błąd 401: cookie nieważne albo wygasło.")
             if not r.ok:
                 raise RuntimeError(f"{r.status_code} {r.text[:300]}")
             return r.json() if r.content else None
         raise RuntimeError(f"Za dużo prób: {url}")
 
-    def list_products(self, universe_id: int) -> list[dict]:
+    def list_items(self, kind: dict, universe_id: int) -> list[dict]:
         out, token = [], ""
         while True:
             params = {"pageSize": 50}
             if token:
                 params["pageToken"] = token
-            d = self.request("GET", f"{API}/{universe_id}/developer-products/creator", params=params)
-            out.extend(d.get("developerProducts", []))
+            d = self.request("GET", kind["base"].format(u=universe_id) + "/creator", params=params)
+            out.extend(d.get(kind["list_key"]) or [])
             token = d.get("nextPageToken")
             if not token:
                 return out
 
-    def create_product(self, universe_id: int, fields: dict, icon: bytes | None) -> dict:
+    def create_item(self, kind: dict, universe_id: int, fields: dict, icon: bytes | None) -> dict:
         files = {k: (None, v) for k, v in fields.items()}
         if icon:
             files["imageFile"] = ("icon.png", icon, "image/png")
-        return self.request("POST", f"{API}/{universe_id}/developer-products", files=files)
+        return self.request("POST", kind["base"].format(u=universe_id), files=files)
 
-    def update_product(self, universe_id: int, product_id: int, fields: dict) -> None:
+    def update_item(self, kind: dict, universe_id: int, item_id: int, fields: dict, icon: bytes | None = None) -> None:
         files = {k: (None, v) for k, v in fields.items()}
-        self.request("PATCH", f"{API}/{universe_id}/developer-products/{product_id}", files=files)
+        if icon:
+            files["imageFile"] = ("icon.png", icon, "image/png")
+        self.request("PATCH", kind["base"].format(u=universe_id) + f"/{item_id}", files=files)
 
     def download_icon(self, asset_id: int) -> bytes | None:
         if not asset_id:
@@ -90,10 +118,176 @@ def price_of(p: dict) -> int | None:
     return int(price) if price is not None else None
 
 
-def load_cookie() -> str:
+def bool_str(v) -> str:
+    return str(bool(v)).lower()
+
+
+def diff_fields(src: dict, dst: dict) -> dict:
+    """Pola do PATCH, żeby dst wyglądał jak src."""
+    fields = {}
+    if (src.get("description") or "") != (dst.get("description") or ""):
+        fields["description"] = src.get("description") or ""
+    if bool(src.get("isForSale")) != bool(dst.get("isForSale")):
+        fields["isForSale"] = bool_str(src.get("isForSale"))
+    sp = price_of(src)
+    if sp is not None and sp != price_of(dst):
+        fields["price"] = str(sp)
+    if bool(src.get("isManagedPricingEnabled")) != bool(dst.get("isManagedPricingEnabled")):
+        fields["isManagedPricingEnabled"] = bool_str(src.get("isManagedPricingEnabled"))
+    return fields
+
+
+def describe_diff(src: dict, dst: dict, fields: dict) -> str:
+    parts = []
+    if "price" in fields:
+        parts.append(f"cena {price_of(dst)} -> {fields['price']}")
+    if "isForSale" in fields:
+        parts.append(f"for sale -> {fields['isForSale']}")
+    if "isManagedPricingEnabled" in fields:
+        parts.append(f"managed -> {fields['isManagedPricingEnabled']}")
+    if "description" in fields:
+        parts.append("opis")
+    return ", ".join(parts)
+
+
+def copy_kind(rbx: Roblox, key: str, source: int, target: int, dry_run: bool, icons: bool | None,
+              delay: float, interactive: bool):
+    kind = KINDS[key]
+    id_key = kind["id_key"]
+    print(f"\n===== {kind['label']} =====")
+    print(f"Pobieram z {source}...")
+    src = rbx.list_items(kind, source)
+    print(f"Pobieram z {target}...")
+    existing = {p["name"]: p for p in rbx.list_items(kind, target)}
+
+    to_create, to_update = [], []
+    for p in src:
+        dst = existing.get(p["name"])
+        if dst is None:
+            to_create.append(p)
+            status = "NOWY"
+        else:
+            fields = diff_fields(p, dst)
+            if fields:
+                to_update.append((p, dst, fields))
+                status = "ZMIANA: " + describe_diff(p, dst, fields)
+            else:
+                status = "bez zmian"
+        print(f"  {price_of(p)!s:>6} R$  {p['name']}  [{status}]")
+
+    print(f"\nŹródło: {len(src)} | nowe: {len(to_create)} | do aktualizacji: {len(to_update)} | "
+          f"bez zmian: {len(src) - len(to_create) - len(to_update)}")
+
+    no_price = [p for p in to_create + [u[0] for u in to_update] if price_of(p) is None and p.get("isForSale")]
+    if no_price:
+        print("\nUWAGA: nie udało się odczytać ceny. Surowe dane pierwszego:")
+        print(json.dumps(no_price[0], indent=2, ensure_ascii=False))
+        raise Abort("Przerwano - pokaż te dane, żeby poprawić price_of().")
+
+    mapping = {p[id_key]: existing[p["name"]][id_key] for p in src if p["name"] in existing}
+
+    if dry_run or not (to_create or to_update):
+        print("Dry run - nic nie zmieniono." if dry_run else "Nic do zrobienia.")
+    elif interactive and input(f"\nUtworzyć {len(to_create)} i zaktualizować {len(to_update)}? [t/N]: ") \
+            .strip().lower() != "t":
+        print("Pominięto.")
+    else:
+        if icons is None:
+            icons = bool(to_create) and input("Kopiować ikony nowym? [t/N]: ").strip().lower() == "t"
+        managed_allowed = True
+        failed = []
+
+        def send(action, fields):
+            # Gra docelowa może nie mieć zaakceptowanego Managed Pricing - wtedy wysyłamy bez niego
+            nonlocal managed_allowed
+            if not managed_allowed:
+                fields.pop("isManagedPricingEnabled", None)
+            try:
+                return action(fields)
+            except RuntimeError as e:
+                if "InvalidManagedPricing" not in str(e):
+                    raise
+                if managed_allowed:
+                    managed_allowed = False
+                    print("   Managed Pricing nie jest zaakceptowane w grze docelowej - pomijam to pole.")
+                fields.pop("isManagedPricingEnabled", None)
+                return action(fields) if fields else None
+
+        total = len(to_create) + len(to_update)
+        n = 0
+        for p in to_create:
+            n += 1
+            fields = {
+                "name": p["name"],
+                "description": p.get("description") or "",
+                "isForSale": bool_str(p.get("isForSale")),
+                "isManagedPricingEnabled": bool_str(p.get("isManagedPricingEnabled")),
+            }
+            if price_of(p) is not None:
+                fields["price"] = str(price_of(p))
+            icon = None
+            if icons:
+                try:
+                    icon = rbx.download_icon(p.get(kind["icon_key"]))
+                except Exception as e:
+                    print(f"   ikona nie poszła: {e}")
+            try:
+                new = send(lambda f: rbx.create_item(kind, target, f, icon), fields)
+                mapping[p[id_key]] = new[id_key]
+                print(f"[{n}/{total}] NOWY  {p['name']}  {p[id_key]} -> {new[id_key]}")
+            except Exception as e:
+                failed.append(p["name"])
+                print(f"[{n}/{total}] BŁĄD  {p['name']}: {e}")
+            time.sleep(delay)
+
+        for p, dst, fields in to_update:
+            n += 1
+            try:
+                send(lambda f: rbx.update_item(kind, target, dst[id_key], f), fields)
+                print(f"[{n}/{total}] ZMIANA  {p['name']}")
+            except Exception as e:
+                failed.append(p["name"])
+                print(f"[{n}/{total}] BŁĄD  {p['name']}: {e}")
+            time.sleep(delay)
+
+        if failed:
+            print(f"\nNie udało się: {len(failed)} - odpal ponownie, gotowe zostaną pominięte.")
+        if not managed_allowed:
+            print("\nCzęść zmian poszła BEZ Managed Pricing. Zaakceptuj je w dashboardzie gry docelowej"
+                  " (Monetization -> Managed pricing) i odpal ponownie - skrypt je włączy.")
+
+    # Mapowanie stare ID -> nowe ID do podmiany w kodzie gry
+    names = {p[id_key]: p["name"] for p in src}
+    stem = f"mapping_{kind['slug']}_{source}_to_{target}"
+    (HERE / f"{stem}.json").write_text(json.dumps({str(k): v for k, v in mapping.items()}, indent=2),
+                                       encoding="utf-8")
+    lua = "return {\n" + "".join(f"\t[{old}] = {new}, -- {names[old]}\n" for old, new in mapping.items()) + "}\n"
+    (HERE / f"{stem}.lua").write_text(lua, encoding="utf-8")
+    print(f"Mapowanie zapisane: {stem}.json / .lua")
+
+
+def list_kind(rbx: Roblox, key: str, universe: int):
+    kind = KINDS[key]
+    items = rbx.list_items(kind, universe)
+    print(f"\n===== {kind['label']} ({len(items)}) =====")
+    for p in items:
+        print(f"{p[kind['id_key']]}\t{price_of(p)!s:>6} R$\t{p['name']}")
+
+    stem = f"lista_{kind['slug']}_{universe}"
+    txt = "".join(f"{p[kind['id_key']]}\t{price_of(p)}\t{p['name']}\n" for p in items)
+    (HERE / f"{stem}.txt").write_text(txt, encoding="utf-8")
+    lua = "return {\n" + "".join(
+        f"\t[{json.dumps(p['name'], ensure_ascii=False)}] = {p[kind['id_key']]},\n" for p in items) + "}\n"
+    (HERE / f"{stem}.lua").write_text(lua, encoding="utf-8")
+    print(f"Zapisane: {stem}.txt / .lua")
+
+
+def load_cookie(prompt: bool = True) -> str:
     cookie = os.environ.get("ROBLOSECURITY", "").strip()
     if not cookie and (HERE / "cookie.txt").exists():
         cookie = (HERE / "cookie.txt").read_text(encoding="utf-8").strip()
+    if not cookie and not prompt:
+        raise Abort("Brak cookie: ustaw ROBLOSECURITY albo zapisz je w cookie.txt obok skryptu.")
     if not cookie:
         print("Wklej cookie .ROBLOSECURITY (F12 -> Application -> Cookies -> roblox.com).")
         print("Nie będzie widoczne podczas wklejania.")
@@ -111,133 +305,79 @@ def ask_int(prompt: str) -> int:
         print("Podaj samą liczbę.")
 
 
-def sync_managed(rbx: Roblox, src: list[dict], target: int, interactive: bool, forced: bool, delay: float):
-    """Włącza Managed Pricing w celu dla produktów, które mają je włączone w źródle (dopasowanie po nazwie)."""
-    managed_in_src = {p["name"] for p in src if p.get("isManagedPricingEnabled")}
-    todo = [p for p in rbx.list_products(target)
-            if p["name"] in managed_in_src and not p.get("isManagedPricingEnabled")]
-    if not todo:
-        return
-    print(f"\n{len(todo)} produktów w celu nie ma Managed Pricing (a w źródle ma).")
-    if not forced and not (interactive and input("Włączyć im Managed Pricing? [t/N]: ").strip().lower() == "t"):
-        if not interactive:
-            print("Dodaj --sync-managed, żeby to włączyć.")
-        return
+def kinds_for(choice: str) -> list[str]:
+    return ["dev", "pass"] if choice == "all" else [choice]
 
-    for i, p in enumerate(todo, 1):
+
+def menu(rbx: Roblox):
+    actions = {
+        "1": ("copy", "dev"),
+        "2": ("copy", "pass"),
+        "3": ("copy", "all"),
+        "4": ("list", "all"),
+    }
+    while True:
+        print("\n1) Kopiuj / aktualizuj developer producty")
+        print("2) Kopiuj / aktualizuj gamepassy")
+        print("3) Kopiuj / aktualizuj oba")
+        print("4) Wypisz nazwy i ID (dev producty + gamepassy)")
+        print("0) Wyjście")
+        choice = input("> ").strip()
+        if choice == "0":
+            return
+        if choice not in actions:
+            continue
+        cmd, what = actions[choice]
         try:
-            rbx.update_product(target, p["productId"], {"isManagedPricingEnabled": "true"})
-            print(f"[{i}/{len(todo)}] OK  {p['name']}")
-        except Exception as e:
-            print(f"[{i}/{len(todo)}] BŁĄD  {p['name']}: {e}")
-            if "InvalidManagedPricing" in str(e):
-                print("Managed Pricing dalej nie jest zaakceptowane w grze docelowej - przerywam.")
-                return
-        time.sleep(delay)
+            if cmd == "copy":
+                source = ask_int("universeId gry ŹRÓDŁOWEJ: ")
+                target = ask_int("universeId gry DOCELOWEJ: ")
+                if source == target:
+                    raise Abort("Źródło i cel to ta sama gra.")
+                for key in kinds_for(what):
+                    copy_kind(rbx, key, source, target, dry_run=False, icons=None, delay=1.0, interactive=True)
+            else:
+                universe = ask_int("universeId gry: ")
+                for key in kinds_for(what):
+                    list_kind(rbx, key, universe)
+        except (Abort, RuntimeError) as e:
+            print(f"\n{e}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Kopiowanie developer productów między grami Roblox.")
-    ap.add_argument("source", nargs="?", type=int, help="universeId gry źródłowej")
-    ap.add_argument("target", nargs="?", type=int, help="universeId gry docelowej")
-    ap.add_argument("--dry-run", action="store_true", help="tylko podgląd, nic nie tworzy")
-    ap.add_argument("--icons", action="store_true", help="kopiuj też ikony")
-    ap.add_argument("--delay", type=float, default=1.5, help="przerwa między produktami (s)")
-    ap.add_argument("--sync-managed", action="store_true",
-                    help="włącz Managed Pricing w celu tam, gdzie jest włączone w źródle")
+    if len(sys.argv) == 1:
+        menu(Roblox(load_cookie()))
+        return
+
+    ap = argparse.ArgumentParser(description="Kopiowanie developer productów i gamepassów między grami Roblox.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("copy", help="kopiuj / aktualizuj")
+    c.add_argument("what", choices=["dev", "pass", "all"])
+    c.add_argument("source", type=int, help="universeId gry źródłowej")
+    c.add_argument("target", type=int, help="universeId gry docelowej")
+    c.add_argument("--dry-run", action="store_true", help="tylko podgląd, nic nie zmienia")
+    c.add_argument("--icons", action="store_true", help="kopiuj ikony nowym")
+    c.add_argument("--delay", type=float, default=1.0, help="przerwa między zapytaniami (s)")
+
+    l = sub.add_parser("list", help="wypisz nazwy i ID")
+    l.add_argument("what", choices=["dev", "pass", "all"])
+    l.add_argument("universe", type=int)
+
     args = ap.parse_args()
-
-    interactive = args.source is None or args.target is None
-    source = args.source or ask_int("universeId gry ŹRÓDŁOWEJ: ")
-    target = args.target or ask_int("universeId gry DOCELOWEJ: ")
-    if source == target:
-        sys.exit("Źródło i cel to ta sama gra.")
-
     rbx = Roblox(load_cookie())
-
-    print(f"\nPobieram produkty z {source}...")
-    src = rbx.list_products(source)
-    print(f"Pobieram produkty z {target}...")
-    existing = {p["name"]: p["productId"] for p in rbx.list_products(target)}
-
-    to_create = [p for p in src if p["name"] not in existing]
-    print(f"\nŹródło: {len(src)} | już w celu: {len(src) - len(to_create)} | do utworzenia: {len(to_create)}\n")
-
-    no_price = [p for p in to_create if price_of(p) is None and p.get("isForSale")]
-    for p in src:
-        status = "pomijam (istnieje)" if p["name"] in existing else "NOWY"
-        print(f"  {price_of(p)!s:>6} R$  {p['name']}  [{status}]")
-
-    if no_price:
-        print("\nUWAGA: nie udało się odczytać ceny dla części produktów. Surowe dane pierwszego:")
-        print(json.dumps(no_price[0], indent=2, ensure_ascii=False))
-        sys.exit("Przerwano - pokaż te dane, żeby poprawić price_of().")
-
-    if args.dry_run or not to_create:
-        print("\nDry run - nic nie utworzono." if args.dry_run else "\nNic do zrobienia.")
-        mapping = {p["productId"]: existing[p["name"]] for p in src if p["name"] in existing}
-    else:
-        if interactive and input(f"\nUtworzyć {len(to_create)} produktów w {target}? [t/N]: ").strip().lower() != "t":
-            sys.exit("Anulowano.")
-        icons = args.icons or (interactive and input("Kopiować ikony? [t/N]: ").strip().lower() == "t")
-
-        mapping = {p["productId"]: existing[p["name"]] for p in src if p["name"] in existing}
-        failed = []
-        managed_allowed = True
-        for i, p in enumerate(to_create, 1):
-            fields = {
-                "name": p["name"],
-                "description": p.get("description") or "",
-                "isForSale": str(bool(p.get("isForSale"))).lower(),
-                "isManagedPricingEnabled": str(managed_allowed and bool(p.get("isManagedPricingEnabled"))).lower(),
-            }
-            price = price_of(p)
-            if price is not None:
-                fields["price"] = str(price)
-
-            icon = None
-            if icons:
-                try:
-                    icon = rbx.download_icon(p.get("iconImageAssetId"))
-                except Exception as e:
-                    print(f"   ikona nie poszła: {e}")
-
-            try:
-                try:
-                    new = rbx.create_product(target, fields, icon)
-                except RuntimeError as e:
-                    if "InvalidManagedPricing" not in str(e):
-                        raise
-                    # Gra docelowa nie ma zaakceptowanego Managed Pricing - tworzymy bez niego
-                    if managed_allowed:
-                        managed_allowed = False
-                        print("   Managed Pricing nie jest zaakceptowane w grze docelowej - tworzę produkty bez niego.")
-                    fields["isManagedPricingEnabled"] = "false"
-                    new = rbx.create_product(target, fields, icon)
-                mapping[p["productId"]] = new["productId"]
-                print(f"[{i}/{len(to_create)}] OK  {p['name']}  {p['productId']} -> {new['productId']}")
-            except Exception as e:
-                failed.append(p["name"])
-                print(f"[{i}/{len(to_create)}] BŁĄD  {p['name']}: {e}")
-            time.sleep(args.delay)
-
-        if failed:
-            print(f"\nNie udało się: {len(failed)} - odpal ponownie, istniejące zostaną pominięte.")
-        if not managed_allowed:
-            print("\nProdukty utworzono BEZ Managed Pricing. Jeśli chcesz, zaakceptuj je w dashboardzie gry docelowej"
-                  " (Monetization -> Managed pricing) i włącz dla produktów.")
-
-    if not args.dry_run:
-        sync_managed(rbx, src, target, interactive, args.sync_managed, args.delay)
-
-    # Mapowanie stare ID -> nowe ID do podmiany w kodzie gry
-    names = {p["productId"]: p["name"] for p in src}
-    out_json = HERE / f"mapping_{source}_to_{target}.json"
-    out_lua = HERE / f"mapping_{source}_to_{target}.lua"
-    out_json.write_text(json.dumps({str(k): v for k, v in mapping.items()}, indent=2), encoding="utf-8")
-    lua = "return {\n" + "".join(f"\t[{old}] = {new}, -- {names[old]}\n" for old, new in mapping.items()) + "}\n"
-    out_lua.write_text(lua, encoding="utf-8")
-    print(f"\nMapowanie zapisane: {out_json.name}, {out_lua.name}")
+    try:
+        if args.cmd == "copy":
+            if args.source == args.target:
+                raise Abort("Źródło i cel to ta sama gra.")
+            for key in kinds_for(args.what):
+                copy_kind(rbx, key, args.source, args.target, args.dry_run, args.icons, args.delay,
+                          interactive=False)
+        else:
+            for key in kinds_for(args.what):
+                list_kind(rbx, key, args.universe)
+    except Abort as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
