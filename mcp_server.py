@@ -1,5 +1,5 @@
 """
-MCP server (stdio) for managing Roblox developer products and game passes.
+MCP server (stdio) for managing Roblox developer products and game passes, and uploading images.
 Cookie: ROBLOSECURITY env variable or cookie.txt next to the script.
 
 Register in Claude Code:
@@ -18,6 +18,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from copy_devproducts import KINDS, Roblox, Abort, copy_kind, load_cookie, price_of, bool_str
+from copy_devproducts import upload_images as upload_image_files
 from i18n import t
 
 Kind = Literal["dev", "pass"]
@@ -28,7 +29,9 @@ server = MCPServer(
         "Manages Roblox developer products (kind='dev') and game passes (kind='pass'). "
         "universe_id is the experience's universe ID (from the Creator Dashboard URL), not the place ID. "
         "Roblox doesn't allow deleting - disable_item takes an item off sale. "
-        "Before calling copy_items with dry_run=False, show the user the dry_run=True result first."
+        "Before calling copy_items with dry_run=False, show the user the dry_run=True result first. "
+        "upload_images uploads image files as decals; use the returned imageId (rbxassetid://<imageId>) "
+        "for ImageLabels / renderImage, not the decalId."
     ),
 )
 
@@ -136,6 +139,18 @@ def copy_items(kind: Literal["dev", "pass", "all"], source_universe_id: int, tar
             copy_kind(rbx(), key, source_universe_id, target_universe_id, dry_run, copy_icons,
                       delay=1.0, interactive=False)
     return log.getvalue()
+
+
+@tool
+def upload_images(paths: list[str], group_id: int | None = None) -> list[dict]:
+    """Uploads image files (png/jpg/bmp/tga) as decals - give files or folders (a folder's images, not its
+    subfolders). Returns, per file: name (file name without extension), decalId and imageId. Use imageId as
+    rbxassetid://<imageId> for ImageLabel.Image / renderImage. group_id uploads to a group instead of the
+    cookie's account. A mapping is also saved to lists/images_<time>.json / .lua."""
+    log = io.StringIO()
+    # stdout is the MCP protocol channel - capture the progress log
+    with contextlib.redirect_stdout(log):
+        return upload_image_files(rbx(), paths, group_id)
 
 
 if __name__ == "__main__":

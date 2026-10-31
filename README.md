@@ -15,6 +15,7 @@ It ships with an **MCP server**, so AI assistants such as Claude Code can list, 
 - **Old → new ID mapping** saved as JSON and as a Lua table, ready to paste into your game scripts (`ProcessReceipt`, `PromptProductPurchase`, `UserOwnsGamePassAsync`).
 - **List names and IDs** of all developer products and game passes in an experience, saved to `.txt` and to a Lua `["name"] = id` table.
 - **Managed Pricing fallback.** If the target experience hasn't accepted Managed Pricing, items are created without it. Accept it in the dashboard and run the tool again to turn it on.
+- **Upload images as decals** (single files or whole folders) and get each one's **image ID**, the one `ImageLabel.Image` / `rbxassetid://` needs. The name → image ID mapping is saved to JSON and a Lua table.
 - **Handles CSRF tokens and rate limits** automatically.
 
 ---
@@ -58,6 +59,7 @@ python copy_devproducts.py
 2) Copy / update game passes
 3) Copy / update both
 4) Print names and IDs (developer products + game passes)
+5) Upload images (decals) -> image IDs
 9) Language: English
 0) Exit
 ```
@@ -88,6 +90,10 @@ python copy_devproducts.py copy all  SOURCE_ID TARGET_ID
 
 # Print names and IDs
 python copy_devproducts.py list all  UNIVERSE_ID
+
+# Upload images as decals (files or folders), print their image IDs
+python copy_devproducts.py upload "C:/Icons" extra.png
+python copy_devproducts.py upload "C:/Icons" --group GROUP_ID
 ```
 
 | Option | Description |
@@ -95,6 +101,7 @@ python copy_devproducts.py list all  UNIVERSE_ID
 | `--dry-run` | Show what would change, change nothing |
 | `--icons` | Copy icons to newly created items |
 | `--delay` | Pause between requests in seconds (default `1.0`) |
+| `--group` | `upload` only: upload to this group instead of your account |
 
 ### Output files
 
@@ -104,6 +111,7 @@ python copy_devproducts.py list all  UNIVERSE_ID
 | `mapping_gamepasses_<src>_to_<dst>.json` / `.lua` | Old game pass ID → new ID |
 | `lists/list_devproducts_<id>.txt` / `.lua` | Names, prices and IDs of developer products |
 | `lists/list_gamepasses_<id>.txt` / `.lua` | Names, prices and IDs of game passes |
+| `lists/images_<time>.json` / `.lua` | Uploaded images: name → decal ID and image ID (`["name"] = "rbxassetid://<image>"`) |
 
 Example Lua mapping:
 
@@ -127,6 +135,7 @@ return {
 | `update_item` | Changes selected fields: name, description, price, for sale, managed pricing, icon |
 | `disable_item` | Takes an item off sale |
 | `copy_items` | Copies or syncs items between experiences. Defaults to a dry run |
+| `upload_images` | Uploads image files or folders as decals; returns each decal ID and image ID |
 
 ### Setup with Claude Code
 

@@ -10,6 +10,7 @@ Usage:
     python copy_devproducts.py copy pass SOURCE TARGET --icons
     python copy_devproducts.py copy all  SOURCE TARGET
     python copy_devproducts.py list all  UNIVERSE
+    python copy_devproducts.py upload FOLDER_OR_FILES... [--group GROUP_ID]
     python copy_devproducts.py lang pl                          # en / pl, saved to settings.json
 
 SOURCE / TARGET / UNIVERSE are universe IDs (from the dashboard URL: .../experiences/<universeId>/...).
@@ -20,6 +21,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -31,6 +33,10 @@ from i18n import t, is_yes
 
 HERE = Path(__file__).resolve().parent
 THUMBS = "https://thumbnails.roblox.com/v1/assets"
+ASSETS = "https://apis.roblox.com/assets/user-auth/v1"
+ASSET_DELIVERY = "https://assetdelivery.roblox.com/v1/asset/"
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".bmp": "image/bmp",
+               ".tga": "image/tga"}
 
 KINDS = {
     "dev": {
@@ -104,6 +110,49 @@ class Roblox:
         if icon:
             files["imageFile"] = ("icon.png", icon, "image/png")
         self.request("PATCH", kind["base"].format(u=universe_id) + f"/{item_id}", files=files)
+
+    def user_id(self) -> int:
+        if not getattr(self, "_user_id", None):
+            self._user_id = self.request("GET", "https://users.roblox.com/v1/users/authenticated")["id"]
+        return self._user_id
+
+    def upload_image(self, path: Path, name: str | None = None, description: str = "",
+                     group_id: int | None = None) -> dict:
+        """Uploads an image as a Decal. Returns the decal id and the id of its image - the one
+        ImageLabel.Image / renderImage need (rbxassetid://<image>)."""
+        creator = {"groupId": str(group_id)} if group_id else {"userId": str(self.user_id())}
+        request = {
+            "assetType": "Decal",
+            "displayName": (name or path.stem)[:50],
+            "description": description,
+            "creationContext": {"creator": creator},
+        }
+        content_type = IMAGE_TYPES.get(path.suffix.lower(), "image/png")
+        files = {
+            "request": (None, json.dumps(request), "application/json"),
+            "fileContent": (path.name, path.read_bytes(), content_type),
+        }
+        op = self.request("POST", f"{ASSETS}/assets", files=files)
+        op_id = op.get("operationId") or op.get("path", "").split("/")[-1]
+        for _ in range(30):
+            if op.get("done"):
+                break
+            time.sleep(2)
+            op = self.request("GET", f"{ASSETS}/operations/{op_id}")
+        if not op.get("done"):
+            raise RuntimeError(t("up_timeout"))
+        decal_id = int(op["response"]["assetId"])
+
+        # The decal's XML names its image
+        image_id = None
+        for _ in range(10):
+            r = self.s.get(ASSET_DELIVERY, params={"id": decal_id}, timeout=30)
+            match = r.ok and re.search(r"id=(\d+)", r.text)
+            if match:
+                image_id = int(match.group(1))
+                break
+            time.sleep(3)
+        return {"name": path.stem, "decalId": decal_id, "imageId": image_id}
 
     def download_icon(self, asset_id: int) -> bytes | None:
         if not asset_id:
@@ -301,6 +350,45 @@ def load_cookie(prompt: bool = True) -> str:
     return cookie
 
 
+def image_files(paths: list[str]) -> list[Path]:
+    """Every image among the given files and folders (folders: their images, not subfolders)."""
+    files = []
+    for raw in paths:
+        p = Path(raw.strip().strip('"'))
+        if p.is_dir():
+            files.extend(sorted(f for f in p.iterdir() if f.suffix.lower() in IMAGE_TYPES))
+        elif p.is_file() and p.suffix.lower() in IMAGE_TYPES:
+            files.append(p)
+    return files
+
+
+def upload_images(rbx: Roblox, paths: list[str], group_id: int | None = None) -> list[dict]:
+    """Uploads the images, prints name -> image id and saves the mapping to lists/."""
+    files = image_files(paths)
+    if not files:
+        raise Abort(t("up_none"))
+    results = []
+    for n, path in enumerate(files, 1):
+        try:
+            res = rbx.upload_image(path, group_id=group_id)
+            print(t("up_ok", n=n, total=len(files), name=res["name"], image=res["imageId"], decal=res["decalId"]))
+            results.append(res)
+        except (RuntimeError, OSError) as e:
+            print(t("up_error", n=n, total=len(files), name=path.stem, err=e))
+            results.append({"name": path.stem, "error": str(e)})
+
+    out_dir = HERE / "lists"
+    out_dir.mkdir(exist_ok=True)
+    stem = f"images_{time.strftime('%Y%m%d_%H%M%S')}"
+    (out_dir / f"{stem}.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+    lua = "return {\n" + "".join(
+        f'\t[{json.dumps(r["name"])}] = "rbxassetid://{r["imageId"]}",\n' for r in results if r.get("imageId")
+    ) + "}\n"
+    (out_dir / f"{stem}.lua").write_text(lua, encoding="utf-8")
+    print(t("saved", stem=f"lists/{stem}"))
+    return results
+
+
 def ask_int(prompt: str) -> int:
     while True:
         v = input(prompt).strip()
@@ -330,7 +418,7 @@ def menu():
     rbx = None
     while True:
         print()
-        for key in ("m_copy_dev", "m_copy_pass", "m_copy_all", "m_list"):
+        for key in ("m_copy_dev", "m_copy_pass", "m_copy_all", "m_list", "m_upload"):
             print(t(key))
         print(t("m_lang", lang=i18n.LANGUAGES[i18n.lang]))
         print(t("m_exit"))
@@ -340,10 +428,16 @@ def menu():
         if choice == "9":
             toggle_language()
             continue
-        if choice not in actions:
+        if choice not in actions and choice != "5":
             continue
         # Ask for the cookie only on the first action, so the language can be changed without signing in
         rbx = rbx or Roblox(load_cookie())
+        if choice == "5":
+            try:
+                upload_images(rbx, [input(t("ask_upload_path"))])
+            except (Abort, RuntimeError) as e:
+                print(f"\n{e}")
+            continue
         cmd, what = actions[choice]
         try:
             if cmd == "copy":
@@ -381,6 +475,10 @@ def main():
     l.add_argument("what", choices=["dev", "pass", "all"])
     l.add_argument("universe", type=int)
 
+    u = sub.add_parser("upload", help=t("cli_upload"))
+    u.add_argument("paths", nargs="+", help=t("cli_upload_paths"))
+    u.add_argument("--group", type=int, default=None, help=t("cli_group"))
+
     g = sub.add_parser("lang", help=t("cli_lang"))
     g.add_argument("code", choices=list(i18n.LANGUAGES))
 
@@ -398,6 +496,8 @@ def main():
             for key in kinds_for(args.what):
                 copy_kind(rbx, key, args.source, args.target, args.dry_run, args.icons, args.delay,
                           interactive=False)
+        elif args.cmd == "upload":
+            upload_images(rbx, args.paths, args.group)
         else:
             for key in kinds_for(args.what):
                 list_kind(rbx, key, args.universe)
