@@ -1,4 +1,4 @@
-# 💰 Roblox Monetization Handler
+# 💰 Roblox Monetization Handler And Image Uploader MCP
 
 A Python tool for copying and syncing **developer products** and **game passes** between Roblox experiences, without an Open Cloud API key. It signs in with your `.ROBLOSECURITY` cookie and uses the same `apis.roblox.com` endpoints as the Creator Dashboard.
 
