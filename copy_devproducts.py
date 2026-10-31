@@ -385,7 +385,7 @@ def upload_images(rbx: Roblox, paths: list[str], group_id: int | None = None) ->
         f'\t[{json.dumps(r["name"])}] = "rbxassetid://{r["imageId"]}",\n' for r in results if r.get("imageId")
     ) + "}\n"
     (out_dir / f"{stem}.lua").write_text(lua, encoding="utf-8")
-    print(t("saved", stem=f"lists/{stem}"))
+    print(t("mapping_saved", stem=f"lists/{stem}"))
     return results
 
 
